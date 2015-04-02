@@ -1,6 +1,6 @@
 package com.tempodb.reactive
 
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.mutable
 
 import com.twitter.util.{Await, Future, Promise}
@@ -32,7 +32,7 @@ class PagingSuite extends FunSuite {
     p
   }
 
-  test("get zipped ints") {
+  test("iterator") {
     case class IntProducer(s: Subscriber[Int], start: Int, end: Int) extends Producer {
       val requested = new AtomicLong
       val numbers = (start until end).toIterator
@@ -58,6 +58,55 @@ class PagingSuite extends FunSuite {
               }
             } while(requested.decrementAndGet() > 0)
           }
+        }
+      }
+    }
+
+    def getObs = Observable {
+      s: Subscriber[Int] => {
+        s.setProducer(new IntProducer(s, 0, 10))
+      }
+    }
+
+    val obs2 = getObs
+    val obs3 = getObs
+    val out = Await.result(toFuture(obs2.zip(obs3).map(_._1).take(10)))
+
+    val expected = for(i <- 0 until 10) yield i
+    assert(expected === out)
+  }
+
+  test("async") {
+    case class IntProducer(s: Subscriber[Int], start: Int, end: Int) extends Producer {
+      val requested = new AtomicLong
+      val emitting = new AtomicBoolean
+      val numbers = (start until end).toIterator
+
+      override def request(n: Long): Unit = {
+        if(n == Long.MaxValue) {
+          println("max")
+          numbers.takeWhile(_ => !s.isUnsubscribed).foreach(s.onNext)
+        } else {
+          val request = requested.getAndAdd(n)
+          // try and claim emission if no other threads are doing so
+          tick()
+        }
+      }
+
+      def tick() {
+        if(emitting.compareAndSet(false, true)) {
+          do {
+            println("request: %d".format(requested.get))
+            if(s.isUnsubscribed) return;
+            if(numbers.hasNext) {
+              println("producer onNext")
+              s.onNext(numbers.next)
+            } else {
+              println("complete")
+              s.onCompleted
+            }
+          } while(requested.decrementAndGet() > 0)
+          emitting.set(false)
         }
       }
     }
