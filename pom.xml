@@ -16,7 +16,7 @@
   <properties>
     <scala.version>2.10</scala.version>
     <scalaLibrary.version>2.10.2</scalaLibrary.version>
-    <finagle.version>6.5.0</finagle.version>
+    <finagle.version>6.24.0</finagle.version>
   </properties>
 
   <repositories>

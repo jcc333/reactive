@@ -1,22 +1,26 @@
 package com.tempodb.reactive
 
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.collection.mutable
 
-import com.twitter.util.{Await, Future, Promise}
+import com.twitter.conversions.time._
+import com.twitter.util.{Await, Future, JavaTimer, Promise}
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
 import rx.lang.scala.{Observable, Producer, Subscriber}
+import rx.lang.scala.schedulers._
 
 
 @RunWith(classOf[JUnitRunner])
 class PagingSuite extends FunSuite {
   import Paging2._
+  implicit val timer = new JavaTimer
 
   def toFuture(obs: Observable[Int]): Future[Seq[Int]] = {
     val p = Promise[Seq[Int]]()
-    obs.toSeq.subscribe(new Subscriber[Seq[Int]] {
+    obs.toSeq.subscribeOn(IOScheduler()).subscribe(new Subscriber[Seq[Int]] {
       override def onStart() {
         request(1)
       }
@@ -39,21 +43,15 @@ class PagingSuite extends FunSuite {
 
       override def request(n: Long): Unit = {
         if(n == Long.MaxValue) {
-          println("max")
           numbers.takeWhile(_ => !s.isUnsubscribed).foreach(s.onNext)
         } else {
           val request = requested.getAndAdd(n)
-          println("n %d".format(n))
-          println("blah: %d".format(request))
           if(request == 0) {
             do {
-              println("request: %d".format(requested.get))
               if(s.isUnsubscribed) return;
               if(numbers.hasNext) {
-                println("producer onNext")
                 s.onNext(numbers.next)
               } else {
-                println("complete")
                 s.onCompleted
               }
             } while(requested.decrementAndGet() > 0)
@@ -78,13 +76,15 @@ class PagingSuite extends FunSuite {
 
   test("async") {
     case class IntProducer(s: Subscriber[Int], start: Int, end: Int) extends Producer {
+      val pageSize = 10000
       val requested = new AtomicLong
       val emitting = new AtomicBoolean
-      val numbers = (start until end).toIterator
+      val requesting = new AtomicBoolean
+      val queue = new ConcurrentLinkedQueue[Int]()
+      val numbers = Stream.from(start).iterator
 
       override def request(n: Long): Unit = {
         if(n == Long.MaxValue) {
-          println("max")
           numbers.takeWhile(_ => !s.isUnsubscribed).foreach(s.onNext)
         } else {
           val request = requested.getAndAdd(n)
@@ -93,20 +93,43 @@ class PagingSuite extends FunSuite {
         }
       }
 
-      def tick() {
-        if(emitting.compareAndSet(false, true)) {
-          do {
-            println("request: %d".format(requested.get))
-            if(s.isUnsubscribed) return;
-            if(numbers.hasNext) {
-              println("producer onNext")
-              s.onNext(numbers.next)
-            } else {
-              println("complete")
-              s.onCompleted
+      def more() {
+        if(requesting.compareAndSet(false, true)) {
+          Future.sleep(1.milliseconds) map { _ =>
+            for(i <- 0 until pageSize) {
+              queue.offer(numbers.next)
             }
-          } while(requested.decrementAndGet() > 0)
-          emitting.set(false)
+            requesting.set(false)
+            tick()
+          } handle {
+            case t: Throwable =>
+              if(!s.isUnsubscribed) {
+                s.onError(t)
+              }
+          }
+        }
+      }
+
+      def tick() {
+        if(queue.isEmpty && requested.get > 0) {
+          more()
+        } else {
+          if(!queue.isEmpty && emitting.compareAndSet(false, true)) {
+            while(!queue.isEmpty && requested.get() > 0) {
+              if(s.isUnsubscribed) {
+                emitting.set(false)
+                return
+              }
+              s.onNext(queue.poll)
+              requested.decrementAndGet()
+            }
+
+            emitting.set(false)
+
+            if(queue.isEmpty && requested.get > 0) {
+              more()
+            }
+          }
         }
       }
     }
@@ -119,9 +142,10 @@ class PagingSuite extends FunSuite {
 
     val obs2 = getObs
     val obs3 = getObs
-    val out = Await.result(toFuture(obs2.zip(obs3).map(_._1).take(10)))
+    //val out = Await.result(toFuture(obs2.drop(10000).take(10)))
 
-    val expected = for(i <- 0 until 10) yield i
+    val out = Await.result(toFuture(obs2.zip(obs3).map(_._1).drop(1000000).take(10)))
+    val expected = for(i <- 1000000 until 1000010) yield i
     assert(expected === out)
   }
 
