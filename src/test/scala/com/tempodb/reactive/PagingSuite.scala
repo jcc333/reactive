@@ -9,8 +9,9 @@ import com.twitter.util.{Await, Future, JavaTimer, Promise}
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
-import rx.lang.scala.{Observable, Producer, Subscriber}
+import rx.lang.scala.{Observable, Observer, Producer, Subscriber, Subject}
 import rx.lang.scala.schedulers._
+import rx.lang.scala.subjects._
 
 
 @RunWith(classOf[JUnitRunner])
@@ -22,6 +23,7 @@ class PagingSuite extends FunSuite {
     val p = Promise[Seq[Int]]()
     obs.toSeq.subscribeOn(IOScheduler()).subscribe(new Subscriber[Seq[Int]] {
       override def onStart() {
+        println("subscribe")
         request(1)
       }
 
@@ -36,7 +38,127 @@ class PagingSuite extends FunSuite {
     p
   }
 
-  test("iterator") {
+  ignore("async subject") {
+
+    var count = 0
+    def ints(start: Int, end: Int): Future[Seq[Int]] = {
+      count = count + 1
+      println(s"count: ${count}")
+      println("query")
+      val limit = 5
+      Future {
+        if(start >= end) {
+          Seq()
+        } else {
+          start until math.min(end, start + limit)
+        }
+      }
+    }
+
+    def page(start: Int, end: Int): Observable[Observable[Int]] = {
+      val s = AsyncSubject[Observable[Int]]()
+      val page = ints(start, end)
+      page.onSuccess(i => {
+        if(i.nonEmpty) {
+          s.onNext(Observable.from(i))
+          s.onCompleted()
+        } else {
+          s.onCompleted()
+        }
+      })
+      page.onFailure((t: Throwable) => s.onError(t))
+      s
+    }
+
+    def streams(start: Int, end: Int): Observable[Observable[Int]] = {
+      def loop(o: Observable[Observable[Int]]): Observable[Observable[Int]] = {
+        o.isEmpty flatMap {
+          case true =>
+            println("empty/end")
+            Observable.empty
+          case false =>
+            println("not empty")
+            o.flatMap { io =>
+              io.doOnCompleted(println("completed"))
+              io.lastOption flatMap {
+                case None =>
+                  println("no last")
+                  Observable.empty
+                case Some(l) =>
+                  println(s"last: ${l}")
+                  o ++ loop(page(l + 1, end))
+              }
+            }
+        }
+      }
+      loop(page(start, end))
+    }
+
+    def stream(start: Int, end: Int): Observable[Int] = streams(start, end).concat
+
+    val obs2 = stream(0, 1000000).observeOn(ComputationScheduler())
+    val obs3 = stream(0, 1000000).observeOn(ComputationScheduler())
+    //obs2.take(14).foreach(i => println(s"i: ${i}"))
+    //obs2.zip(obs3).map(_._1).take(14).foreach(i => println(s"i: ${i}"))
+
+    val out = Await.result(toFuture(obs2.zip(obs3).map(_._1).drop(2000000).take(10)))
+    val expected = for(i <- 2000000 until 2000010) yield i
+    assert(expected === out)
+  }
+
+  test("blah") {
+
+    def ints(start: Int, end: Int): Future[Seq[Int]] = {
+      println("query")
+      val limit = 1000
+      Future {
+        if(start >= end) {
+          Seq()
+        } else {
+          start until math.min(end, start + limit)
+        }
+      }
+    }
+
+    def page(start: Int, end: Int): Observable[(Observable[Int], Option[Int])] = {
+      val s = AsyncSubject[(Observable[Int], Option[Int])]()
+      val page = ints(start, end)
+      page.onSuccess(i => {
+        if(i.nonEmpty) {
+          s.onNext((Observable.from(i), Some(i.last + 1)))
+          s.onCompleted()
+        } else {
+          s.onNext(Observable.empty, None)
+          s.onCompleted()
+        }
+      })
+      page.onFailure((t: Throwable) => s.onError(t))
+      s
+    }
+
+    def stream(start: Int, end: Int): Observable[Int] = {
+      val subject = ReplaySubject[Int]()
+      val o = subject.toSerialized
+        .flatMap { n =>
+          println(s"n: ${n}")
+          page(n, end) flatMap {
+            case (io, None) => Observable.just(Observable.empty.doOnCompleted(subject.onCompleted))
+            case (io, Some(next)) => Observable.just(io.doOnCompleted(subject.onNext(next)))
+          }
+        }.concat.share
+      subject.onNext(start)
+      o
+    }
+
+    val obs2 = stream(0, 6000000).observeOn(ComputationScheduler())
+    val obs3 = stream(0, 6000000).observeOn(ComputationScheduler())
+
+    val out = Await.result(toFuture(obs2.zip(obs3).map(_._1).drop(5000000).take(10)))
+    val expected = for(i <- 5000000 until 5000010) yield i
+    assert(expected === out)
+  }
+
+  ignore("iterator") {
     case class IntProducer(s: Subscriber[Int], start: Int, end: Int) extends Producer {
       val requested = new AtomicLong
       val numbers = (start until end).toIterator
@@ -74,7 +196,7 @@ class PagingSuite extends FunSuite {
     assert(expected === out)
   }
 
-  test("async") {
+  ignore("async") {
     case class IntProducer(s: Subscriber[Int], start: Int, end: Int) extends Producer {
       val pageSize = 10000
       val requested = new AtomicLong
@@ -149,7 +271,7 @@ class PagingSuite extends FunSuite {
     assert(expected === out)
   }
 
-  test("backpressure exception") {
+  ignore("backpressure exception") {
     def getObs = Observable {
       s: Subscriber[Int] => {
         val start = 0
